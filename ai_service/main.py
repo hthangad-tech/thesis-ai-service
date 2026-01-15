@@ -12,9 +12,12 @@ from io import BytesIO
 
 from utils.image_similarity import compare_images
 from utils.duplicate_detection import find_duplicates
+from utils.face_verification import router as face_router
 
 
 app = FastAPI(title="Thesis System AI Service")
+app.include_router(face_router)
+
 
 
 # -----------------------------
