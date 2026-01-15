@@ -6,3 +6,4 @@ numpy
 imagehash
 pillow
 httpx
+python-multipart
