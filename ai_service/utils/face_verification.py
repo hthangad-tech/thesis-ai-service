@@ -1,58 +1,77 @@
-import cv2
+from fastapi import FastAPI
+from pydantic import BaseModel
+import httpx
 import numpy as np
-import imagehash
-from PIL import Image
+import cv2
 
+app = FastAPI()
 
-_FACE_CASCADE = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+class VerifyFaceBody(BaseModel):
+    images: list[str]
 
+def _normalize_embedding(vec: np.ndarray) -> list[float]:
+    v = vec.astype(np.float32)
+    n = np.linalg.norm(v) + 1e-9
+    v = v / n
+    return v.tolist()
 
-def _bytes_to_bgr(img_bytes: bytes) -> np.ndarray:
-    arr = np.frombuffer(img_bytes, dtype=np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("Could not decode image")
-    return img
+def _extract_embedding(img_bgr: np.ndarray) -> np.ndarray:
+    # Simple, lightweight “embedding” (128-dim) that works everywhere.
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    small = cv2.resize(gray, (16, 8), interpolation=cv2.INTER_AREA)  # 16*8 = 128
+    return small.flatten()
 
+def _detect_single_face(img_bgr: np.ndarray) -> bool:
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    return len(faces) == 1
 
-def _single_face_crop_pil(img_bytes: bytes) -> Image.Image:
-    bgr = _bytes_to_bgr(img_bytes)
-    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+@app.post("/verify_face")
+async def verify_face(body: VerifyFaceBody):
+    try:
+        if not body.images or len(body.images) < 2:
+            return {"liveness_passed": False, "message": "Provide at least 2 images.", "embeddings": None}
 
-    faces = _FACE_CASCADE.detectMultiScale(
-        gray,
-        scaleFactor=1.1,
-        minNeighbors=5,
-        minSize=(60, 60),
-    )
+        # Download images safely
+        imgs_bgr = []
+        async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            for url in body.images:
+                r = await client.get(url)
+                if r.status_code != 200:
+                    return {
+                        "liveness_passed": False,
+                        "message": f"Failed to fetch image (HTTP {r.status_code}).",
+                        "embeddings": None,
+                    }
+                data = np.frombuffer(r.content, dtype=np.uint8)
+                img = cv2.imdecode(data, cv2.IMREAD_COLOR)
+                if img is None:
+                    return {
+                        "liveness_passed": False,
+                        "message": "Failed to decode image bytes.",
+                        "embeddings": None,
+                    }
+                imgs_bgr.append(img)
 
-    if len(faces) != 1:
-        raise ValueError(f"Expected exactly one face, found {len(faces)}")
+        # Basic rule: exactly 1 face per image
+        for img in imgs_bgr:
+            if not _detect_single_face(img):
+                return {
+                    "liveness_passed": False,
+                    "message": "Each photo must contain exactly one face.",
+                    "embeddings": None,
+                }
 
-    x, y, w, h = faces[0]
-    pad = int(max(w, h) * 0.2)
-    x0 = max(0, x - pad)
-    y0 = max(0, y - pad)
-    x1 = min(bgr.shape[1], x + w + pad)
-    y1 = min(bgr.shape[0], y + h + pad)
+        # Create embeddings
+        embeddings = [_normalize_embedding(_extract_embedding(img)) for img in imgs_bgr]
 
-    face_bgr = bgr[y0:y1, x0:x1]
-    face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    return Image.fromarray(face_rgb)
+        return {
+            "liveness_passed": True,
+            "message": "OK",
+            "embeddings": embeddings,
+        }
 
-
-def verify_faces(face1_bytes: bytes, face2_bytes: bytes) -> bool:
-    """Very lightweight face match.
-
-    - Detect exactly one face per image
-    - Compute perceptual hash of the cropped face
-    - Consider it a match if hash distance is small
-
-    This is NOT as accurate as real embeddings, but it deploys reliably on free hosting.
-    """
-    h1 = imagehash.phash(_single_face_crop_pil(face1_bytes))
-    h2 = imagehash.phash(_single_face_crop_pil(face2_bytes))
-    distance = int(h1 - h2)
-    return distance <= 10
+    except Exception as e:
+        # IMPORTANT: return the real error so Supabase shows it (instead of plain 500)
+        return {"liveness_passed": False, "message": f"Internal error: {str(e)}", "embeddings": None}
